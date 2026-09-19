@@ -238,3 +238,87 @@ tbody tr.selected { background: #2a2f45; }
 }
 
 #status.warn { color: #f0b35e; }
+
+/* ---------- 区间变速 ---------- */
+
+#retime-panel {
+  flex: none;
+  padding: 8px 16px;
+  background: #1a1c26;
+  border-bottom: 1px solid #2c2f3c;
+}
+
+.retime-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.retime-row label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #9aa0b4;
+  font-size: 12px;
+}
+
+.retime-row input {
+  background: #14151b;
+  border: 1px solid #3a3e4f;
+  color: #e6e6eb;
+  border-radius: 4px;
+  padding: 5px 8px;
+  width: 132px;
+  font-size: 12px;
+}
+
+.retime-row input:focus { outline: none; border-color: #2f5fd0; }
+.retime-row input:disabled { opacity: 0.5; }
+
+#retime-info {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #8fd18f;
+}
+
+#retime-info.warn { color: #f0b35e; }
+
+#retime-conflicts {
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+#retime-conflicts li {
+  color: #f0b35e;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 0;
+}
+
+#retime-conflicts li:hover { text-decoration: underline; }
+
+/* 时间轴上的区间覆盖层：蓝色 = 所选区间，绿色 = 预览中的目标区间 */
+#range-overlay {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: rgba(47, 95, 208, 0.16);
+  border-left: 2px solid #2f5fd0;
+  border-right: 2px solid #2f5fd0;
+  pointer-events: none;
+  z-index: 5;
+}
+
+#range-overlay.preview {
+  background: rgba(63, 185, 80, 0.14);
+  border-color: #3fb950;
+}
+
+.block.retime-affected {
+  border-color: #3fb950;
+  box-shadow: 0 0 0 1px #3fb950;
+}
+
+tbody tr.retime-affected { background: rgba(63, 185, 80, 0.08); }

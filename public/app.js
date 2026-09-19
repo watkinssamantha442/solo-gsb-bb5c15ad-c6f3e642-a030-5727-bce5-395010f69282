@@ -4,7 +4,8 @@
 
   const {
     MIN_DURATION_MS, MIN_GAP_MS,
-    msToTimecode, parseSrt, formatSrt, normalize, applyDrag, applyMove, validate,
+    msToTimecode, parseTimeInput, parseSrt, formatSrt, normalize,
+    applyDrag, applyMove, planRetime, applyPlan, validate,
   } = SubEngine;
 
   const MIN_PPS = 10;    // 像素/秒，缩放范围
@@ -14,9 +15,11 @@
   const state = {
     cues: [],          // [{start, end, text}]
     pxPerSec: 120,
-    undoStack: [],     // 每次拖动前的 [{start,end},...] 快照
+    undoStack: [],     // 每次拖动/变速前的 [{start,end},...] 快照
     selected: -1,
     drag: null,        // {index, edge: 'start'|'end'|'move', moved, grabOffset, el, snapshot}
+    retime: null,      // 变速预览中 {plan, backup, affectedSet}
+    rangeOverlay: null,// 时间轴区间覆盖层 {fromMs, toMs, preview}
     fileName: 'edited.srt',
   };
 
@@ -40,7 +43,8 @@
   /* ---------------- 渲染 ---------------- */
 
   function contentWidthPx() {
-    const endMs = state.cues.length ? state.cues[state.cues.length - 1].end : 0;
+    let endMs = state.cues.length ? state.cues[state.cues.length - 1].end : 0;
+    if (state.rangeOverlay) endMs = Math.max(endMs, state.rangeOverlay.toMs); // 覆盖层不被裁剪
     const w = (endMs + 5000) / 1000 * state.pxPerSec; // 末尾留白 5s
     return Math.max(w, scroller.clientWidth);
   }
@@ -78,11 +82,13 @@
 
   function updateBlocks(from) {
     const pps = state.pxPerSec;
+    const affected = state.retime ? state.retime.affectedSet : null;
     for (let i = Math.max(0, from); i < state.cues.length; i++) {
       const c = state.cues[i];
       const el = blockEls[i];
       el.style.left = (c.start / 1000 * pps) + 'px';
       el.style.width = ((c.end - c.start) / 1000 * pps) + 'px';
+      el.classList.toggle('retime-affected', !!(affected && affected.has(i)));
       el.querySelector('.block-time').textContent =
         msToTimecode(c.start) + ' → ' + msToTimecode(c.end);
       const textEl = el.querySelector('.block-text');
@@ -91,6 +97,7 @@
   }
 
   function updateRows(from) {
+    const affected = state.retime ? state.retime.affectedSet : null;
     for (let i = Math.max(0, from); i < state.cues.length; i++) {
       const c = state.cues[i];
       const td = rowEls[i].children;
@@ -99,6 +106,7 @@
       td[2].textContent = msToTimecode(c.end);
       td[3].textContent = ((c.end - c.start) / 1000).toFixed(3) + 's';
       if (td[4].textContent !== c.text) td[4].textContent = c.text;
+      rowEls[i].classList.toggle('retime-affected', !!(affected && affected.has(i)));
     }
   }
 
@@ -141,8 +149,8 @@
 
   function updateUndoButton() {
     const btn = $('#btn-undo');
-    btn.disabled = state.undoStack.length === 0;
-    btn.textContent = state.undoStack.length ? '撤销拖动 (' + state.undoStack.length + ')' : '撤销拖动';
+    btn.disabled = state.undoStack.length === 0 || !!state.retime; // 预览期间禁止撤销
+    btn.textContent = state.undoStack.length ? '撤销 (' + state.undoStack.length + ')' : '撤销';
   }
 
   function renderDynamic(from) {
@@ -170,6 +178,7 @@
       trackEl.textContent = ''; blockEls = [];
       listBody.textContent = ''; rowEls = [];
       rulerEl.textContent = ''; rulerWidth = 0;
+      positionRangeOverlay();
       updateStatus();
       return;
     }
@@ -179,6 +188,7 @@
     renderRuler();
     renderDynamic(0);
     markSelected();
+    positionRangeOverlay();
   }
 
   /* ---------------- 选择 ---------------- */
@@ -203,6 +213,7 @@
   /* ---------------- 拖动 ---------------- */
 
   trackEl.addEventListener('pointerdown', (e) => {
+    if (state.retime) return; // 变速预览期间禁止拖动
     const blockEl = e.target.closest('.block');
     if (!blockEl) return;
     const index = Number(blockEl.dataset.i);
@@ -260,6 +271,7 @@
   /* ---------------- 撤销 ---------------- */
 
   function undo() {
+    if (state.retime) return; // 变速预览期间禁止撤销
     const snap = state.undoStack.pop();
     if (!snap) return;
     state.cues.forEach((c, i) => { c.start = snap[i].start; c.end = snap[i].end; });
@@ -272,8 +284,193 @@
         !/^(INPUT|TEXTAREA)$/.test(e.target.tagName)) {
       e.preventDefault();
       undo();
+    } else if (e.key === 'Escape' && state.retime) {
+      cancelRetime(); // Esc 取消变速预览
     }
   });
+
+  /* ---------------- 区间变速 ---------------- */
+
+  const retimePanel = $('#retime-panel');
+  const retimeIn = $('#retime-in');
+  const retimeOut = $('#retime-out');
+  const retimeTarget = $('#retime-target');
+  const retimeInfo = $('#retime-info');
+  const retimeConflictsEl = $('#retime-conflicts');
+  const rangeOverlay = $('#range-overlay');
+  const btnRetimePreview = $('#btn-retime-preview');
+  const btnRetimeApply = $('#btn-retime-apply');
+  const btnRetimeCancel = $('#btn-retime-cancel');
+
+  function setRetimeInfo(msg, warn) {
+    retimeInfo.textContent = msg;
+    retimeInfo.classList.toggle('warn', !!warn);
+  }
+
+  function clearConflicts() {
+    retimeConflictsEl.textContent = '';
+  }
+
+  function showConflicts(conflicts) {
+    clearConflicts();
+    for (const c of conflicts) {
+      const li = document.createElement('li');
+      li.textContent = '⚠ ' + c.message + '（点击定位）';
+      li.addEventListener('click', () => {
+        selectCue(c.index);
+        scrollBlockIntoView(c.index);
+      });
+      retimeConflictsEl.appendChild(li);
+    }
+  }
+
+  function readRetimeParams() {
+    return {
+      inMs: parseTimeInput(retimeIn.value),
+      outMs: parseTimeInput(retimeOut.value),
+      targetMs: parseTimeInput(retimeTarget.value),
+    };
+  }
+
+  function positionRangeOverlay() {
+    const r = state.rangeOverlay;
+    if (!r || !state.cues.length || r.toMs <= r.fromMs) {
+      rangeOverlay.hidden = true;
+      return;
+    }
+    rangeOverlay.hidden = false;
+    rangeOverlay.style.left = (r.fromMs / 1000 * state.pxPerSec) + 'px';
+    rangeOverlay.style.width = ((r.toMs - r.fromMs) / 1000 * state.pxPerSec) + 'px';
+    rangeOverlay.classList.toggle('preview', !!r.preview);
+  }
+
+  // 输入入点/出点时实时标出所选区间（预览中则保持显示目标区间）
+  function updateRangeOverlayFromInputs() {
+    if (state.retime) return;
+    const { inMs, outMs } = readRetimeParams();
+    state.rangeOverlay = (inMs != null && outMs != null && outMs > inMs)
+      ? { fromMs: inMs, toMs: outMs, preview: false }
+      : null;
+    positionRangeOverlay();
+  }
+
+  function setPreviewUi(previewing) {
+    btnRetimePreview.disabled = previewing;
+    btnRetimeApply.disabled = !previewing;
+    btnRetimeCancel.disabled = !previewing;
+    retimeIn.disabled = retimeOut.disabled = retimeTarget.disabled = previewing;
+    $('#btn-export').disabled = previewing || !state.cues.length;
+    updateUndoButton();
+  }
+
+  function openRetimePanel() {
+    if (!state.cues.length) {
+      statusEl.textContent = '⚠ 请先导入字幕，再使用区间变速';
+      statusEl.classList.add('warn');
+      return;
+    }
+    retimePanel.hidden = false;
+    // 默认填入选中字幕的范围，未选中则为整个时间轴
+    const sel = state.cues[state.selected];
+    const inMs = sel ? sel.start : 0;
+    const outMs = sel ? sel.end : state.cues[state.cues.length - 1].end;
+    retimeIn.value = msToTimecode(inMs);
+    retimeOut.value = msToTimecode(outMs);
+    retimeTarget.value = ((outMs - inMs) / 1000).toFixed(3);
+    clearConflicts();
+    setPreviewUi(false);
+    setRetimeInfo('设置入点、出点与目标时长后点击「预览」（时间支持 秒 / MM:SS,mmm / HH:MM:SS,mmm）', false);
+    updateRangeOverlayFromInputs();
+  }
+
+  function closeRetimePanel() {
+    if (state.retime) cancelRetime(); // 收起面板视同取消预览
+    retimePanel.hidden = true;
+    state.rangeOverlay = null;
+    positionRangeOverlay();
+    clearConflicts();
+  }
+
+  // 导入新文件时调用：丢弃预览状态（字幕已被整体替换，无需恢复备份）
+  function resetRetime() {
+    state.retime = null;
+    state.rangeOverlay = null;
+    retimePanel.hidden = true;
+    clearConflicts();
+    setPreviewUi(false);
+    positionRangeOverlay();
+  }
+
+  function previewRetime() {
+    if (state.retime || !state.cues.length) return;
+    clearConflicts();
+    const { inMs, outMs, targetMs } = readRetimeParams();
+    if (inMs == null || outMs == null || targetMs == null) {
+      setRetimeInfo('⚠ 时间格式无效：支持纯秒数（如 3.5）、MM:SS,mmm 或 HH:MM:SS,mmm', true);
+      return;
+    }
+    const plan = planRetime(state.cues, inMs, outMs, targetMs);
+    if (!plan.ok) {
+      if (plan.conflicts) {
+        showConflicts(plan.conflicts);
+        setRetimeInfo('⚠ 存在 ' + plan.conflicts.length +
+          ' 处冲突，未修改任何字幕；点击上方冲突可定位，调整参数后重新预览', true);
+      } else {
+        setRetimeInfo('⚠ ' + plan.reason, true);
+      }
+      return;
+    }
+    // 进入预览：备份现状并应用方案，「取消预览」可原样恢复
+    state.retime = {
+      plan,
+      backup: state.cues.map(c => ({ start: c.start, end: c.end })),
+      affectedSet: new Set(plan.affected),
+    };
+    applyPlan(state.cues, plan);
+    state.rangeOverlay = { fromMs: plan.inMs, toMs: plan.newOutMs, preview: true };
+    setPreviewUi(true);
+    setRetimeInfo(
+      '预览中：锚点 ' + msToTimecode(plan.inMs) + ' 不动，缩放 ×' + plan.scale.toFixed(3) +
+      '，影响第 ' + (plan.affected[0] + 1) + '–' + (plan.affected[plan.affected.length - 1] + 1) +
+      ' 条（共 ' + plan.affected.length + ' 条）。确认后点击「应用变速」，或「取消预览」(Esc) 恢复。', false);
+    renderAll();
+  }
+
+  function cancelRetime() {
+    if (!state.retime) return;
+    const backup = state.retime.backup;
+    state.cues.forEach((c, i) => { c.start = backup[i].start; c.end = backup[i].end; });
+    state.retime = null;
+    setPreviewUi(false);
+    setRetimeInfo('已取消预览，未修改任何字幕。', false);
+    updateRangeOverlayFromInputs();
+    renderAll();
+  }
+
+  function applyRetime() {
+    if (!state.retime) return;
+    state.undoStack.push(state.retime.backup); // 一次变速只产生一条撤销记录
+    if (state.undoStack.length > UNDO_LIMIT) state.undoStack.shift();
+    state.retime = null;
+    state.rangeOverlay = null;
+    setPreviewUi(false);
+    updateUndoButton();
+    setRetimeInfo('已应用区间变速。可用「撤销」或 Ctrl+Z 回退。', false);
+    renderAll();
+  }
+
+  $('#btn-retime').addEventListener('click', () => {
+    if (retimePanel.hidden) openRetimePanel(); else closeRetimePanel();
+  });
+  $('#btn-retime-close').addEventListener('click', closeRetimePanel);
+  btnRetimePreview.addEventListener('click', previewRetime);
+  btnRetimeApply.addEventListener('click', applyRetime);
+  btnRetimeCancel.addEventListener('click', cancelRetime);
+  retimeIn.addEventListener('input', updateRangeOverlayFromInputs);
+  retimeOut.addEventListener('input', updateRangeOverlayFromInputs);
+  [retimeIn, retimeOut, retimeTarget].forEach(el => el.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') previewRetime();
+  }));
 
   /* ---------------- 缩放 ---------------- */
 
@@ -317,6 +514,7 @@
       statusEl.classList.add('warn');
       return;
     }
+    resetRetime(); // 新文件替换全部字幕，丢弃未确认的变速预览
     state.cues = cues;
     state.fileName = name.replace(/\.[^.]*$/, '') + '.srt';
     state.undoStack = [];
@@ -371,8 +569,9 @@
       '3', '00:00:04,500 --> 00:00:06,000', '右边界越过安全线时会递归推移后继块', '',
       '4', '00:00:06,200 --> 00:00:08,500', '向回拖动只释放空隙，不会拉回后继', '',
       '5', '00:00:08,800 --> 00:00:11,000', '每块至少 500ms，块间至少 100ms，起点不为负', '',
-      '6', '00:00:11,300 --> 00:00:13,600', 'Ctrl+滚轮缩放时间轴，Ctrl+Z 撤销拖动', '',
-      '7', '00:00:13,900 --> 00:00:16,500', '完成后点击「导出 SRT」保存合法字幕文件', '',
+      '6', '00:00:11,300 --> 00:00:13,600', 'Ctrl+滚轮缩放时间轴，Ctrl+Z 撤销操作', '',
+      '7', '00:00:13,900 --> 00:00:16,500', '「区间变速」设置入点、出点与目标时长，预览确认后应用', '',
+      '8', '00:00:16,800 --> 00:00:19,200', '完成后点击「导出 SRT」保存合法字幕文件', '',
     ].join('\n'), 'demo.srt');
   });
 

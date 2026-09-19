@@ -164,3 +164,136 @@ test('validate 能发现全部三类违规', () => {
   // 负起点 + 第一块时长不足 + 第二块时长不足 + 间隔不足
   assert.equal(problems.length, 4);
 });
+
+/* ---------------- 区间变速 ---------------- */
+
+test('parseTimeInput：纯秒数、MM:SS、HH:MM:SS、毫秒与非法输入', () => {
+  assert.equal(E.parseTimeInput('3.5'), 3500);
+  assert.equal(E.parseTimeInput('90'), 90000);
+  assert.equal(E.parseTimeInput('02:03'), 123000);
+  assert.equal(E.parseTimeInput('02:03,500'), 123500);
+  assert.equal(E.parseTimeInput('1:02:03.456'), 3723456);
+  assert.equal(E.parseTimeInput(' 2.5 '), 2500);
+  assert.equal(E.parseTimeInput('bad'), null);
+  assert.equal(E.parseTimeInput(''), null);
+  assert.equal(E.parseTimeInput(null), null);
+});
+
+test('区间变速：区间内字幕按锚点线性映射，区间外不动，文本与顺序保持', () => {
+  const cues = [cue(0, 1000, 'a'), cue(2000, 3000, 'b'), cue(4000, 5000, 'c'), cue(6000, 7000, 'd')];
+  const plan = E.planRetime(cues, 2000, 5000, 1500); // 压缩一半
+  assert.equal(plan.ok, true);
+  assert.equal(plan.scale, 0.5);
+  assert.deepEqual(plan.affected, [1, 2]);
+  assert.equal(plan.newOutMs, 3500);
+  E.applyPlan(cues, plan);
+  assert.deepEqual(cues.map(c => [c.start, c.end]), [
+    [0, 1000],      // 区间外不动
+    [2000, 2500],   // 锚点 2000 不动，时长 1000 -> 500
+    [3000, 3500],   // 4000->3000，出点 5000->3500
+    [6000, 7000],   // 区间外不动
+  ]);
+  assert.deepEqual(cues.map(c => c.text), ['a', 'b', 'c', 'd']); // 文本与相对顺序保持
+  assert.deepEqual(E.validate(cues), []);
+});
+
+test('区间变速：跨越边界的字幕只映射区间内端点', () => {
+  const cues = [cue(0, 2500), cue(3000, 4000), cue(4500, 8000)];
+  const plan = E.planRetime(cues, 2000, 5000, 1500); // scale 0.5
+  assert.equal(plan.ok, true);
+  assert.deepEqual(plan.affected, [0, 1, 2]);
+  E.applyPlan(cues, plan);
+  assert.deepEqual(cues.map(c => [c.start, c.end]), [
+    [0, 2250],      // 跨左边界：起点不动，终点 2500 -> 2250
+    [2500, 3000],   // 区间内整体映射
+    [3250, 8000],   // 跨右边界：起点 4500 -> 3250，终点不动
+  ]);
+  assert.deepEqual(E.validate(cues), []);
+});
+
+test('区间变速：完整覆盖区间的字幕端点均在区间外，保持不动', () => {
+  const cues = [cue(0, 10000)];
+  const plan = E.planRetime(cues, 2000, 5000, 1500);
+  assert.equal(plan.ok, true);
+  assert.deepEqual(plan.affected, [0]);
+  E.applyPlan(cues, plan);
+  assert.deepEqual([cues[0].start, cues[0].end], [0, 10000]);
+});
+
+test('区间变速：映射后自动补足最短时长', () => {
+  const cues = [cue(2000, 3000)];
+  const plan = E.planRetime(cues, 2000, 4000, 600); // 时长 1000 -> 300，不足 500
+  assert.equal(plan.ok, true);
+  E.applyPlan(cues, plan);
+  assert.deepEqual([cues[0].start, cues[0].end], [2000, 2500]); // 补足到 500ms
+  assert.deepEqual(E.validate(cues), []);
+});
+
+test('区间变速：映射后自动后移间隔不足的受影响后继（保持时长）', () => {
+  const cues = [cue(2000, 3000), cue(3100, 4100)];
+  const plan = E.planRetime(cues, 2000, 4100, 630); // scale 0.3
+  assert.equal(plan.ok, true);
+  E.applyPlan(cues, plan);
+  assert.deepEqual(cues.map(c => [c.start, c.end]), [
+    [2000, 2500],   // 300 -> 补足 500
+    [2600, 3100],   // 间隔不足 100ms，整体后移并保持 500 时长
+  ]);
+  assert.deepEqual(E.validate(cues), []);
+});
+
+test('区间变速：拉伸后与区间外后继间隔不足 -> 可定位冲突，不静默改写', () => {
+  const cues = [cue(2000, 3000), cue(4050, 5000, '外')];
+  const before = JSON.parse(JSON.stringify(cues));
+  const plan = E.planRetime(cues, 2000, 3000, 2000); // 第一条终点 -> 4000
+  assert.equal(plan.ok, false);
+  assert.equal(plan.conflicts.length, 1);
+  assert.equal(plan.conflicts[0].index, 1);          // 可定位到区间外那条
+  assert.match(plan.conflicts[0].message, /第 2 条/);
+  assert.match(plan.conflicts[0].message, /间隔不足 100ms/);
+  assert.deepEqual(cues, before);                      // 纯函数：区间内外均未改写
+});
+
+test('区间变速：压缩后与区间外前驱间隔不足 -> 可定位冲突', () => {
+  const cues = [cue(0, 1960), cue(2100, 3000)];
+  const plan = E.planRetime(cues, 2000, 3000, 500); // 第二条起点 -> 2050，间隔 90ms
+  assert.equal(plan.ok, false);
+  assert.equal(plan.conflicts.length, 1);
+  assert.equal(plan.conflicts[0].index, 1);
+  assert.match(plan.conflicts[0].message, /第 2 条/);
+  assert.deepEqual(cues.map(c => [c.start, c.end]), [[0, 1960], [2100, 3000]]); // 未被修改
+});
+
+test('区间变速：区间外终点被新区间吞没 -> 冲突而非静默截断', () => {
+  const cues = [cue(2100, 2600)]; // 终点 2600 在出点 2400 之外
+  const plan = E.planRetime(cues, 2000, 2400, 5000); // 映射起点 3250 越过终点
+  assert.equal(plan.ok, false);
+  assert.equal(plan.conflicts[0].index, 0);
+  assert.match(plan.conflicts[0].message, /第 1 条/);
+  assert.deepEqual([cues[0].start, cues[0].end], [2100, 2600]);
+});
+
+test('区间变速：参数错误与空区间', () => {
+  const cues = [cue(0, 1000)];
+  assert.match(E.planRetime(cues, -5, 1000, 500).reason, /入点不能为负/);
+  assert.match(E.planRetime(cues, 3000, 2000, 500).reason, /出点必须大于入点/);
+  assert.match(E.planRetime(cues, 0, 1000, 0).reason, /目标时长必须大于 0/);
+  assert.match(E.planRetime(cues, 5000, 6000, 500).reason, /区间内没有字幕/);
+});
+
+test('区间变速：应用方案后整体合法且可导出回读', () => {
+  const cues = E.normalize(E.parseSrt([
+    '1', '00:00:00,000 --> 00:00:01,000', '甲', '',
+    '2', '00:00:02,000 --> 00:00:03,000', '乙', '',
+    '3', '00:00:04,000 --> 00:00:05,000', '丙', '',
+  ].join('\n')));
+  const plan = E.planRetime(cues, 1500, 5000, 7000); // 拉伸一倍
+  assert.equal(plan.ok, true);
+  E.applyPlan(cues, plan);
+  assert.deepEqual(cues.map(c => [c.start, c.end]), [
+    [0, 1000],      // 区间外不动
+    [2500, 4500],   // 2000->2500，3000->4500
+    [6500, 8500],   // 4000->6500，5000->8500
+  ]);
+  assert.deepEqual(E.validate(cues), []);
+  assert.deepEqual(E.parseSrt(E.formatSrt(cues)), cues); // 导出可回读
+});
