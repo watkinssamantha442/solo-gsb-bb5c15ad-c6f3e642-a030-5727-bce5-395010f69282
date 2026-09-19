@@ -164,3 +164,133 @@ test('validate 能发现全部三类违规', () => {
   // 负起点 + 第一块时长不足 + 第二块时长不足 + 间隔不足
   assert.equal(problems.length, 4);
 });
+
+/* ---------------- 区间变速 ---------------- */
+
+test('区间变速：区间内字幕按锚点线性映射，区间外不动', () => {
+  const cues = [
+    cue(0, 1000, 'a'),
+    cue(2000, 3000, 'b'),
+    cue(3200, 3800, 'c'),
+    cue(5000, 6000, 'd'),
+  ];
+  const before = JSON.parse(JSON.stringify(cues));
+  // 区间 [2000, 4000] → 目标 3000ms，k = 1.5
+  const res = E.stretchRange(cues, 2000, 4000, 3000);
+  assert.ok(res.ok);
+  assert.equal(res.ratio, 1.5);
+  assert.deepEqual(res.affected, [1, 2]);
+  assert.deepEqual(res.cues.map(c => [c.start, c.end]), [
+    [0, 1000],      // 区间外：不动
+    [2000, 3500],   // 2000 + 1000*1.5
+    [3800, 4700],   // 2000 + 1200*1.5 → 2000 + 1800*1.5
+    [5000, 6000],   // 区间外：不动
+  ]);
+  assert.deepEqual(res.cues.map(c => c.text), ['a', 'b', 'c', 'd']); // 文本保持
+  assert.deepEqual(cues, before);                                     // 入参不被修改
+  assert.deepEqual(E.validate(res.cues), []);
+});
+
+test('区间变速：压缩后自动补足最短时长并级联右移', () => {
+  const cues = [cue(0, 600, 'a'), cue(700, 1300, 'b'), cue(1400, 2000, 'c'), cue(2100, 2600, 'd')];
+  // 区间 [700, 2100] → 目标 700ms，k = 0.5；b 压缩到 300ms 需补足，c 被级联右移
+  const res = E.stretchRange(cues, 700, 2100, 700);
+  assert.ok(res.ok);
+  assert.deepEqual(res.cues.map(c => [c.start, c.end]), [
+    [0, 600],
+    [700, 1200],    // 映射为 [700,1000]，补足最短时长 500
+    [1300, 1800],   // 映射为 [1050,1350]，间隔不足整体右移 250，再补足最短时长
+    [2100, 2600],   // 区间外：不动
+  ]);
+  assert.deepEqual(E.validate(res.cues), []);
+});
+
+test('区间变速：跨越边界的块只映射落在区间内的一端', () => {
+  const cues = [cue(0, 1500, 'a'), cue(1600, 2200, 'b')];
+  // 区间 [1000, 2000] → 目标 500ms，k = 0.5
+  // a 跨越入点：起点 0 不动，终点映射为 1250；b 跨越出点：终点 2200 不动
+  const res = E.stretchRange(cues, 1000, 2000, 500);
+  assert.ok(res.ok);
+  assert.deepEqual(res.affected, [0, 1]);
+  assert.deepEqual(res.cues.map(c => [c.start, c.end]), [
+    [0, 1250],
+    [1350, 2250],   // 起点映射为 1300，与 a 间隔不足被整体右移 50（终点随之移动）
+  ]);
+  assert.deepEqual(E.validate(res.cues), []);
+});
+
+test('区间变速：完全覆盖区间的块两端都在区间外，保持不动', () => {
+  const cues = [cue(0, 5000, 'a')];
+  const res = E.stretchRange(cues, 1000, 2000, 3000);
+  assert.ok(res.ok);
+  assert.deepEqual(res.affected, [0, 0]);
+  assert.deepEqual([res.cues[0].start, res.cues[0].end], [0, 5000]);
+});
+
+test('区间变速：与区间外后继冲突时不静默改写，返回可定位冲突', () => {
+  const cues = [cue(0, 600, 'a'), cue(700, 1300, 'b'), cue(1400, 2000, 'c')];
+  const before = JSON.parse(JSON.stringify(cues));
+  // b 扩张到 [700, 2700]，撞上区间外的 c
+  const res = E.stretchRange(cues, 700, 1300, 2000);
+  assert.equal(res.ok, false);
+  assert.equal(res.cues, null);
+  assert.ok(res.message.includes('第 2 条'));
+  assert.ok(res.message.includes('第 3 条'));
+  assert.deepEqual(res.conflicts.map(c => c.index), [1, 2]); // 可定位：双方下标
+  assert.deepEqual(cues, before); // 冲突时原数组分毫不动
+});
+
+test('区间变速：跨越出点的块映射后起终点倒置 → 可定位冲突', () => {
+  const cues = [cue(0, 1000, 'a'), cue(1100, 1600, 'b'), cue(1700, 2500, 'c')];
+  const before = JSON.parse(JSON.stringify(cues));
+  // 区间 [1200, 2000] → 目标 5000ms，k = 6.25；c 起点映射为 4325 > 其终点 2500
+  const res = E.stretchRange(cues, 1200, 2000, 5000);
+  assert.equal(res.ok, false);
+  assert.equal(res.conflicts.length, 1);
+  assert.equal(res.conflicts[0].index, 2);
+  assert.ok(res.message.includes('第 3 条'));
+  assert.deepEqual(cues, before);
+});
+
+test('区间变速：左缘与区间外前驱间隔不足时自动右移受影响块', () => {
+  const cues = [cue(0, 960, 'a'), cue(1100, 2000, 'b')];
+  // 区间 [1000, 2000] → 目标 500ms，k = 0.5；b 起点映射为 1050，与 a 间隔 90 < 100
+  const res = E.stretchRange(cues, 1000, 2000, 500);
+  assert.ok(res.ok);
+  assert.deepEqual(res.cues.map(c => [c.start, c.end]), [
+    [0, 960],       // 区间外前驱：不动
+    [1060, 1560],   // 整体右移 10 拉开间隔，再补足最短时长 500
+  ]);
+  assert.deepEqual(E.validate(res.cues), []);
+});
+
+test('区间变速：保持文本与相对顺序', () => {
+  const cues = [
+    cue(1000, 1600, '甲'), cue(1700, 2300, '乙'), cue(2400, 3000, '丙'), cue(4000, 5000, '丁'),
+  ];
+  const res = E.stretchRange(cues, 1000, 3100, 1050); // k = 0.5
+  assert.ok(res.ok);
+  assert.deepEqual(res.cues.map(c => c.text), ['甲', '乙', '丙', '丁']);
+  for (let i = 1; i < res.cues.length; i++) {
+    assert.ok(res.cues[i].start >= res.cues[i - 1].end + E.MIN_GAP_MS);
+  }
+  assert.deepEqual(E.validate(res.cues), []);
+});
+
+test('区间变速：非法参数与空区间', () => {
+  const cues = [cue(0, 1000, 'a')];
+  assert.equal(E.stretchRange(cues, -1, 1000, 500).ok, false);   // 入点为负
+  assert.equal(E.stretchRange(cues, 1000, 1000, 500).ok, false); // 出点不大于入点
+  assert.equal(E.stretchRange(cues, 0, 1000, 0).ok, false);      // 目标时长非正
+  assert.equal(E.stretchRange(cues, 2000, 3000, 500).ok, false); // 区间内无字幕
+  assert.equal(E.stretchRange([], 0, 1000, 500).ok, false);      // 空时间轴
+});
+
+test('区间变速：极小压缩比下区间内块由最短时长修正兜底，不误报倒置', () => {
+  const cues = [cue(0, 1000, 'a')];
+  // 1 小时区间压到 1 秒：a 完全在区间内部，映射后时长不足 1ms，应补足 500ms 而不是报冲突
+  const res = E.stretchRange(cues, 0, 3600000, 1000);
+  assert.ok(res.ok);
+  assert.deepEqual([res.cues[0].start, res.cues[0].end], [0, 500]);
+  assert.deepEqual(E.validate(res.cues), []);
+});

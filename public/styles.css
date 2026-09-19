@@ -65,6 +65,53 @@ button.primary:hover:not(:disabled) { background: #3a6de0; }
 #zoom-slider { width: 120px; }
 #zoom-label { min-width: 72px; color: #9aa0b4; font-size: 12px; }
 
+/* ---------- 区间变速面板 ---------- */
+
+#stretch-panel {
+  flex: none;
+  padding: 8px 16px;
+  background: #1a1c26;
+  border-bottom: 1px solid #2c2f3c;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+#stretch-panel[hidden] { display: none; }
+
+.stretch-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+
+.stretch-row label {
+  color: #9aa0b4;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.stretch-row input {
+  width: 150px;
+  background: #12131a;
+  color: #e6e6eb;
+  border: 1px solid #3a3e4f;
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
+.stretch-row input:focus { outline: none; border-color: #2f5fd0; }
+
+#stretch-msg { font-size: 12px; color: #8fd18f; }
+#stretch-msg.warn { color: #f0b35e; }
+#stretch-msg a { color: #6ea8ff; margin-left: 10px; }
+
+button.armed { border-color: #f0a832; color: #f0a832; }
+
 /* ---------- 时间轴 ---------- */
 
 main {
@@ -114,6 +161,42 @@ main {
   height: calc(100% - 26px);
 }
 
+/* 区间变速：入点/出点/新出点标记与区间高亮（不拦截鼠标） */
+
+#timeline-scroll.arming { cursor: crosshair; }
+
+#stretch-region {
+  position: absolute;
+  top: 26px;
+  bottom: 0;
+  background: rgba(110, 168, 255, 0.10);
+  border-top: 1px solid rgba(110, 168, 255, 0.25);
+  z-index: 1;
+  pointer-events: none;
+}
+
+.marker {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-left: 2px solid #4caf7d;
+  z-index: 4;
+  pointer-events: none;
+}
+
+.marker span {
+  position: absolute;
+  top: 2px;
+  left: 4px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+#mark-in { border-color: #4caf7d; color: #4caf7d; }
+#mark-out { border-color: #e06c75; color: #e06c75; }
+#mark-target { border-left-style: dashed; border-color: #6ea8ff; color: #6ea8ff; }
+
 .block {
   position: absolute;
   top: 14px;
@@ -135,6 +218,14 @@ main {
   border-color: #f0a832;
   box-shadow: 0 0 0 1px #f0a832;
 }
+
+/* 区间变速预览：受影响块换色，预览期间禁止拖动 */
+.block.stretch-affected {
+  background: linear-gradient(180deg, #6b4a8f, #5a3f7c);
+  border-color: #a06fc4;
+}
+
+body.previewing .block { cursor: default; }
 
 .handle {
   flex: none;
@@ -223,6 +314,7 @@ td:last-child {
 tbody tr { cursor: pointer; }
 tbody tr:hover { background: #1c1e28; }
 tbody tr.selected { background: #2a2f45; }
+tbody tr.stretch-affected { background: #262033; }
 
 .col-idx { width: 48px; color: #6b7086; }
 

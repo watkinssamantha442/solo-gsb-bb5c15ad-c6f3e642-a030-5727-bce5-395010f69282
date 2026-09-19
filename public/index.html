@@ -13,7 +13,8 @@
       <button id="btn-import" class="primary">导入 SRT</button>
       <input type="file" id="file-input" accept=".srt,.txt" hidden>
       <button id="btn-demo">载入示例</button>
-      <button id="btn-undo" disabled>撤销拖动</button>
+      <button id="btn-undo" disabled title="撤销最近一次拖动或区间变速（Ctrl+Z）">撤销</button>
+      <button id="btn-stretch" title="按入点/出点/目标时长整体伸缩一段字幕">区间变速</button>
       <button id="btn-export" class="primary" disabled>导出 SRT</button>
       <span class="sep"></span>
       <button id="btn-zoom-out" title="缩小">−</button>
@@ -24,11 +25,32 @@
     </div>
   </header>
 
+  <section id="stretch-panel" hidden>
+    <div class="stretch-row">
+      <label>入点 <input id="stretch-in" class="mono" placeholder="00:00:05,000 或 5"></label>
+      <button id="btn-set-in" title="点击后在时间轴上单击设置入点（Esc 取消）">点击设入点</button>
+      <label>出点 <input id="stretch-out" class="mono" placeholder="00:00:10,000 或 10"></label>
+      <button id="btn-set-out" title="点击后在时间轴上单击设置出点（Esc 取消）">点击设出点</button>
+      <label>目标时长 <input id="stretch-target" class="mono" placeholder="如 8 或 00:00:08,000"></label>
+      <button id="btn-read-selected" title="用选中字幕块的起止时间填充入点/出点">读取选中块</button>
+    </div>
+    <div class="stretch-row">
+      <button id="btn-stretch-preview" class="primary">预览</button>
+      <button id="btn-stretch-apply" disabled>确认应用</button>
+      <button id="btn-stretch-cancel" disabled>取消预览</button>
+      <span id="stretch-msg"></span>
+    </div>
+  </section>
+
   <main>
     <section id="timeline-scroll">
       <div id="timeline-content">
         <div id="ruler"></div>
         <div id="track"></div>
+        <div id="stretch-region" hidden></div>
+        <div id="mark-in" class="marker" hidden><span>入点</span></div>
+        <div id="mark-out" class="marker" hidden><span>出点</span></div>
+        <div id="mark-target" class="marker" hidden><span>新出点</span></div>
       </div>
       <div id="empty-hint">
         将 .srt 文件拖入页面，或点击「导入 SRT」<br>

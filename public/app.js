@@ -4,7 +4,7 @@
 
   const {
     MIN_DURATION_MS, MIN_GAP_MS,
-    msToTimecode, parseSrt, formatSrt, normalize, applyDrag, applyMove, validate,
+    msToTimecode, parseSrt, formatSrt, normalize, applyDrag, applyMove, stretchRange, validate,
   } = SubEngine;
 
   const MIN_PPS = 10;    // 像素/秒，缩放范围
@@ -14,9 +14,10 @@
   const state = {
     cues: [],          // [{start, end, text}]
     pxPerSec: 120,
-    undoStack: [],     // 每次拖动前的 [{start,end},...] 快照
+    undoStack: [],     // 每次拖动/变速前的 [{start,end},...] 快照
     selected: -1,
     drag: null,        // {index, edge: 'start'|'end'|'move', moved, grabOffset, el, snapshot}
+    stretch: null,     // 区间变速预览：{original, affected:[i0,i1], ratio}
     fileName: 'edited.srt',
   };
 
@@ -31,11 +32,23 @@
   const fileInput = $('#file-input');
   const zoomSlider = $('#zoom-slider');
   const zoomLabel = $('#zoom-label');
+  const stretchPanel = $('#stretch-panel');
+  const stretchIn = $('#stretch-in');
+  const stretchOut = $('#stretch-out');
+  const stretchTarget = $('#stretch-target');
+  const stretchMsg = $('#stretch-msg');
+  const btnSetIn = $('#btn-set-in');
+  const btnSetOut = $('#btn-set-out');
+  const markIn = $('#mark-in');
+  const markOut = $('#mark-out');
+  const markTarget = $('#mark-target');
+  const stretchRegion = $('#stretch-region');
 
   let blockEls = [];   // 与 state.cues 对应的块元素池
   let rowEls = [];     // 列表行元素池
   let rulerWidth = 0;  // 已渲染刻度的宽度，避免拖动中重复渲染
   let rafPending = false;
+  let armTarget = null; // 'in' | 'out'：等待在时间轴上单击设入点/出点
 
   /* ---------------- 渲染 ---------------- */
 
@@ -78,11 +91,14 @@
 
   function updateBlocks(from) {
     const pps = state.pxPerSec;
+    const st = state.stretch;
     for (let i = Math.max(0, from); i < state.cues.length; i++) {
       const c = state.cues[i];
       const el = blockEls[i];
       el.style.left = (c.start / 1000 * pps) + 'px';
       el.style.width = ((c.end - c.start) / 1000 * pps) + 'px';
+      el.classList.toggle('stretch-affected',
+        !!(st && i >= st.affected[0] && i <= st.affected[1]));
       el.querySelector('.block-time').textContent =
         msToTimecode(c.start) + ' → ' + msToTimecode(c.end);
       const textEl = el.querySelector('.block-text');
@@ -91,9 +107,13 @@
   }
 
   function updateRows(from) {
+    const st = state.stretch;
     for (let i = Math.max(0, from); i < state.cues.length; i++) {
       const c = state.cues[i];
-      const td = rowEls[i].children;
+      const tr = rowEls[i];
+      tr.classList.toggle('stretch-affected',
+        !!(st && i >= st.affected[0] && i <= st.affected[1]));
+      const td = tr.children;
       td[0].textContent = i + 1;
       td[1].textContent = msToTimecode(c.start);
       td[2].textContent = msToTimecode(c.end);
@@ -141,8 +161,8 @@
 
   function updateUndoButton() {
     const btn = $('#btn-undo');
-    btn.disabled = state.undoStack.length === 0;
-    btn.textContent = state.undoStack.length ? '撤销拖动 (' + state.undoStack.length + ')' : '撤销拖动';
+    btn.disabled = state.undoStack.length === 0 || !!state.stretch;
+    btn.textContent = state.undoStack.length ? '撤销 (' + state.undoStack.length + ')' : '撤销';
   }
 
   function renderDynamic(from) {
@@ -171,6 +191,7 @@
       listBody.textContent = ''; rowEls = [];
       rulerEl.textContent = ''; rulerWidth = 0;
       updateStatus();
+      updateStretchMarkers();
       return;
     }
     ensureBlocks();
@@ -179,6 +200,7 @@
     renderRuler();
     renderDynamic(0);
     markSelected();
+    updateStretchMarkers();
   }
 
   /* ---------------- 选择 ---------------- */
@@ -203,6 +225,7 @@
   /* ---------------- 拖动 ---------------- */
 
   trackEl.addEventListener('pointerdown', (e) => {
+    if (state.stretch) return; // 预览期间禁止拖动，先确认或取消
     const blockEl = e.target.closest('.block');
     if (!blockEl) return;
     const index = Number(blockEl.dataset.i);
@@ -260,6 +283,7 @@
   /* ---------------- 撤销 ---------------- */
 
   function undo() {
+    if (state.stretch) return; // 预览期间请先「确认应用」或「取消预览」
     const snap = state.undoStack.pop();
     if (!snap) return;
     state.cues.forEach((c, i) => { c.start = snap[i].start; c.end = snap[i].end; });
@@ -268,6 +292,11 @@
   }
   $('#btn-undo').addEventListener('click', undo);
   window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      if (state.stretch) cancelStretch(false);   // Esc 取消预览
+      else if (armTarget) setArm(null);          // Esc 取消「点击设点」
+      return;
+    }
     if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'z' &&
         !/^(INPUT|TEXTAREA)$/.test(e.target.tagName)) {
       e.preventDefault();
@@ -321,8 +350,9 @@
     state.fileName = name.replace(/\.[^.]*$/, '') + '.srt';
     state.undoStack = [];
     state.selected = -1;
+    state.stretch = null; // 新文件，丢弃未确认的预览
     updateUndoButton();
-    $('#btn-export').disabled = false;
+    updateStretchUI();
     renderAll();
     fitZoom();
   }
@@ -348,7 +378,7 @@
   });
 
   $('#btn-export').addEventListener('click', () => {
-    if (!state.cues.length) return;
+    if (!state.cues.length || state.stretch) return; // 预览期间禁止导出
     const problems = validate(state.cues);
     if (problems.length) {
       alert('时间轴不合法，无法导出：\n' + problems.join('\n'));
@@ -362,6 +392,178 @@
     URL.revokeObjectURL(a.href);
   });
 
+  /* ---------------- 区间变速 ---------------- */
+
+  /** 解析时间输入：支持 HH:MM:SS,mmm / MM:SS.mmm / 纯秒数；非法返回 null */
+  function parseTimeInput(str) {
+    const s = String(str).trim();
+    if (!s) return null;
+    if (s.indexOf(':') === -1) {
+      const sec = Number(s);
+      return Number.isFinite(sec) && sec >= 0 ? Math.round(sec * 1000) : null;
+    }
+    const parts = s.split(':');
+    if (parts.length === 2) {
+      const m = Number(parts[0]);
+      const sec = Number(parts[1].replace(',', '.'));
+      if (!Number.isFinite(m) || !Number.isFinite(sec) || m < 0 || sec < 0 || sec >= 60) return null;
+      return Math.round((m * 60 + sec) * 1000);
+    }
+    return SubEngine.timecodeToMs(s);
+  }
+
+  /** 在面板消息区显示结果；冲突条目渲染为可点击的「定位」链接 */
+  function showStretchMsg(text, conflicts, ok) {
+    stretchMsg.textContent = text || '';
+    stretchMsg.classList.toggle('warn', !ok);
+    (conflicts || []).forEach((c) => {
+      const a = document.createElement('a');
+      a.href = '#';
+      a.textContent = '定位第 ' + (c.index + 1) + ' 条';
+      a.title = c.message || '';
+      a.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        selectCue(c.index);
+        scrollBlockIntoView(c.index);
+      });
+      stretchMsg.appendChild(a);
+    });
+  }
+
+  function setArm(which) {
+    armTarget = which;
+    btnSetIn.classList.toggle('armed', which === 'in');
+    btnSetOut.classList.toggle('armed', which === 'out');
+    scroller.classList.toggle('arming', !!which);
+  }
+
+  /** 刷新入点/出点/新出点标记线与区间高亮（预览期间隐藏） */
+  function updateStretchMarkers() {
+    const pps = state.pxPerSec;
+    const inMs = parseTimeInput(stretchIn.value);
+    const outMs = parseTimeInput(stretchOut.value);
+    const targetMs = parseTimeInput(stretchTarget.value);
+    const active = !stretchPanel.hidden && !state.stretch && state.cues.length > 0;
+    const showMark = (el, ms) => {
+      if (active && ms != null) {
+        el.hidden = false;
+        el.style.left = (ms / 1000 * pps) + 'px';
+      } else {
+        el.hidden = true;
+      }
+    };
+    showMark(markIn, inMs);
+    showMark(markOut, outMs);
+    showMark(markTarget, inMs != null && targetMs != null ? inMs + targetMs : null);
+    if (active && inMs != null && outMs != null && outMs > inMs) {
+      stretchRegion.hidden = false;
+      stretchRegion.style.left = (inMs / 1000 * pps) + 'px';
+      stretchRegion.style.width = ((outMs - inMs) / 1000 * pps) + 'px';
+    } else {
+      stretchRegion.hidden = true;
+    }
+  }
+
+  function updateStretchUI() {
+    const previewing = !!state.stretch;
+    $('#btn-stretch-apply').disabled = !previewing;
+    $('#btn-stretch-cancel').disabled = !previewing;
+    $('#btn-export').disabled = previewing || !state.cues.length;
+    btnSetIn.disabled = previewing;
+    btnSetOut.disabled = previewing;
+    $('#btn-read-selected').disabled = previewing;
+    if (previewing) setArm(null);
+    document.body.classList.toggle('previewing', previewing);
+    updateUndoButton();
+    updateStretchMarkers();
+  }
+
+  function readStretchInputs() {
+    const inMs = parseTimeInput(stretchIn.value);
+    const outMs = parseTimeInput(stretchOut.value);
+    const targetMs = parseTimeInput(stretchTarget.value);
+    if (inMs == null) { showStretchMsg('⚠ 入点无效：支持时间码（如 00:00:05,000）或秒数', [], false); return null; }
+    if (outMs == null) { showStretchMsg('⚠ 出点无效：支持时间码（如 00:00:10,000）或秒数', [], false); return null; }
+    if (targetMs == null) { showStretchMsg('⚠ 目标时长无效：支持秒数（如 8）或时间码', [], false); return null; }
+    return { inMs, outMs, targetMs };
+  }
+
+  function previewStretch() {
+    if (!state.cues.length) { showStretchMsg('⚠ 请先导入字幕', [], false); return; }
+    const p = readStretchInputs();
+    if (!p) return;
+    // 预览期间再次点击「预览」时，始终基于原始时间轴重新计算
+    const base = state.stretch ? state.stretch.original : state.cues;
+    const res = SubEngine.stretchRange(base, p.inMs, p.outMs, p.targetMs);
+    if (!res.ok) { showStretchMsg('⚠ ' + res.message, res.conflicts, false); return; }
+    state.stretch = { original: base, affected: res.affected, ratio: res.ratio };
+    state.cues = res.cues;
+    renderAll();
+    const a = res.affected[0], b = res.affected[1];
+    let msg = '预览中：第 ' + (a + 1) + '–' + (b + 1) + ' 条（共 ' + (b - a + 1) +
+      ' 条）按 ×' + res.ratio.toFixed(3) + ' 映射';
+    if (res.cues[b].end !== p.inMs + p.targetMs) {
+      msg += '；受最短时长/间隔约束，区间实际终于 ' + msToTimecode(res.cues[b].end);
+    }
+    showStretchMsg(msg + '，请「确认应用」或「取消预览」（Esc）。', [], true);
+    scrollBlockIntoView(a);
+    updateStretchUI();
+  }
+
+  function applyStretch() {
+    const st = state.stretch;
+    if (!st) return;
+    // 与拖动共用撤销栈：一条记录回退整次变速
+    state.undoStack.push(st.original.map((c) => ({ start: c.start, end: c.end })));
+    if (state.undoStack.length > UNDO_LIMIT) state.undoStack.shift();
+    state.stretch = null;
+    showStretchMsg('✓ 已应用区间变速，可用「撤销」（Ctrl+Z）回退。', [], true);
+    renderAll();
+    updateStretchUI();
+  }
+
+  function cancelStretch(silent) {
+    const st = state.stretch;
+    if (!st) return;
+    state.cues = st.original;
+    state.stretch = null;
+    renderAll();
+    updateStretchUI();
+    if (!silent) showStretchMsg('已取消预览，时间轴恢复原状。', [], true);
+  }
+
+  $('#btn-stretch').addEventListener('click', () => {
+    stretchPanel.hidden = !stretchPanel.hidden;
+    if (stretchPanel.hidden) cancelStretch(true); // 收起面板即退出预览
+    updateStretchUI();
+  });
+  btnSetIn.addEventListener('click', () => setArm(armTarget === 'in' ? null : 'in'));
+  btnSetOut.addEventListener('click', () => setArm(armTarget === 'out' ? null : 'out'));
+  $('#btn-read-selected').addEventListener('click', () => {
+    const c = state.cues[state.selected];
+    if (!c) { showStretchMsg('⚠ 请先在时间轴或列表中选中一条字幕', [], false); return; }
+    stretchIn.value = msToTimecode(c.start);
+    stretchOut.value = msToTimecode(c.end);
+    updateStretchMarkers();
+  });
+  $('#btn-stretch-preview').addEventListener('click', previewStretch);
+  $('#btn-stretch-apply').addEventListener('click', applyStretch);
+  $('#btn-stretch-cancel').addEventListener('click', () => cancelStretch(false));
+  [stretchIn, stretchOut, stretchTarget].forEach((el) =>
+    el.addEventListener('input', updateStretchMarkers));
+
+  // 「点击设入点/出点」武装后，在时间轴上单击取时间（捕获阶段拦截，避免触发拖动）
+  scroller.addEventListener('pointerdown', (e) => {
+    if (!armTarget || state.stretch) return;
+    const rect = content.getBoundingClientRect();
+    const t = Math.max(0, Math.round((e.clientX - rect.left) / state.pxPerSec * 1000));
+    (armTarget === 'in' ? stretchIn : stretchOut).value = msToTimecode(t);
+    setArm(null);
+    updateStretchMarkers();
+    e.preventDefault();
+    e.stopPropagation();
+  }, true);
+
   /* ---------------- 示例 ---------------- */
 
   $('#btn-demo').addEventListener('click', () => {
@@ -371,8 +573,9 @@
       '3', '00:00:04,500 --> 00:00:06,000', '右边界越过安全线时会递归推移后继块', '',
       '4', '00:00:06,200 --> 00:00:08,500', '向回拖动只释放空隙，不会拉回后继', '',
       '5', '00:00:08,800 --> 00:00:11,000', '每块至少 500ms，块间至少 100ms，起点不为负', '',
-      '6', '00:00:11,300 --> 00:00:13,600', 'Ctrl+滚轮缩放时间轴，Ctrl+Z 撤销拖动', '',
+      '6', '00:00:11,300 --> 00:00:13,600', 'Ctrl+滚轮缩放时间轴，Ctrl+Z 撤销', '',
       '7', '00:00:13,900 --> 00:00:16,500', '完成后点击「导出 SRT」保存合法字幕文件', '',
+      '8', '00:00:16,800 --> 00:00:19,200', '工具栏「区间变速」可按入点/出点/目标时长整体伸缩一段字幕', '',
     ].join('\n'), 'demo.srt');
   });
 
